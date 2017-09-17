@@ -6,6 +6,7 @@ import xmltodict
 import pickle
 import requests as req
 
+from aiohttp.helpers import DummyCookieJar
 
 class Publication:
     '''
@@ -90,15 +91,13 @@ class Publication:
         return header
 
 
-async def get_pmid_block(session, block_size=500):
-    '''
-    https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?db=pubmed&term=PNAS[ta]+AND+97[vi]&retstart=6&retmax=6&tool=biomed3
-    '''
+async def get_pmid_count(session):
     base_url = 'https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?'
 
     req_params = {'db': 'pubmed', 
                   'retmode': 'json',
-                  'rettype': 'count',
+                  'rettype': 'uilist',
+                  'usehistory': 'y',
                   'mindate': '2014',
                   'maxdate': '2014',
                   'datetype': 'pdate',
@@ -106,38 +105,83 @@ async def get_pmid_block(session, block_size=500):
                   'term': '2014'}
     async with session.get(base_url, params=req_params) as resp:
         assert resp.status == 200
-        count_data = await resp.json()
+        resp_data = await resp.json()
 
-    count = int(count_data['esearchresult']['count'])
+    count = int(resp_data['esearchresult']['count'])
+    webenv = resp_data['esearchresult']['webenv']
+    query_key = resp_data['esearchresult']['querykey']
 
-    retmax_requests = list(range(block_size, int(count), block_size))
-    retmax_requests.append(count - retmax_requests[len(retmax_requests) - 1])
+    return (count, webenv, query_key)
+
+
+async def get_pmid_block(session, total_pmids, webenv, query_key, block_size=100):
+    '''
+    https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?db=pubmed&term=PNAS[ta]+AND+97[vi]&retstart=6&retmax=6&tool=biomed3
+    '''
+    base_url = 'https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?'
+
+    retmax_requests = list(range(block_size, int(total_pmids), block_size))
+    retmax_requests.append(total_pmids - retmax_requests[len(retmax_requests) - 1])
 
     for i, retmax in enumerate(retmax_requests):
         percent_done = (float(i) / float(len(retmax_requests))) * 100
 
         req_params = params={'db': 'pubmed',
                             'retmode': 'json',
+                            'email': 'vassily@broadinstitute.org',
                             'usehistory': 'y',
                             'retstart': retmax,
                             'retmax': block_size,
+                            'webenv': webenv,
+                            'query_key': query_key,
                             'field': 'DP',
                             'term': '2014',
                             'mindate': '2014',
                             'maxdate': '2014',
                             'datetype': 'pdat'}
 
-        resp = req.get(base_url, params=req_params)
-        assert resp.status_code == 200
-        pmid_block = resp.json()
-        yield (pmid_block['esearchresult']['idlist'], percent_done)
-
         # async version also times out for some reason -- worth posting about
-        # async with session.get(base_url, params=req_params) as resp:
-        #     assert resp.status == 200
-        #     pmid_block = await resp.json()
-        #     yield  (pmid_block['esearchresult']['idlist'], percent_done)
-            
+        async with session.get(base_url, params=req_params) as resp:
+            assert resp.status == 200
+            resp_data = await resp.json()
+            webenv = resp_data['esearchresult']['webenv']
+            query_key = resp_data['esearchresult']['querykey']
+            yield (resp_data['esearchresult']['idlist'], percent_done)
+
+def reg_get_pmid_block(session, total_pmids, webenv, query_key, block_size=500):
+    '''
+    https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?db=pubmed&term=PNAS[ta]+AND+97[vi]&retstart=6&retmax=6&tool=biomed3
+    '''
+    base_url = 'https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?'
+
+    retmax_requests = list(range(block_size, int(total_pmids), block_size))
+    retmax_requests.append(total_pmids - retmax_requests[len(retmax_requests) - 1])
+
+    for i, retmax in enumerate(retmax_requests):
+        percent_done = (float(i) / float(len(retmax_requests))) * 100
+
+        req_params = params={'db': 'pubmed',
+                            'retmode': 'json',
+                            'email': 'vassily@broadinstitute.org',
+                            'usehistory': 'y',
+                            'retstart': retmax,
+                            'retmax': block_size,
+                            'webenv': webenv,
+                            'query_key': query_key,
+                            'field': 'DP',
+                            'term': '2014',
+                            'mindate': '2014',
+                            'maxdate': '2014',
+                            'datetype': 'pdat'}
+
+        try:
+            resp = req.get(base_url, params=req_params)
+            assert resp.status_code == 200
+            pmid_block = resp.json()
+            id_list = pmid_block['esearchresult']['idlist']
+        except:
+            id_list = []
+        yield (id_list, percent_done, i)     
 
 async def get_author_count(session, pmids):
     base_url = 'https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?'
@@ -145,33 +189,57 @@ async def get_author_count(session, pmids):
                 params={'db': 'pubmed', 'id': ','.join(pmids), 'retmode': 'xml'}) as efetch_handle:
         assert efetch_handle.status == 200
 
-        efetch_data = await efetch_handle.text()
-        return xmltodict.parse(efetch_data, xml_attribs=True)
+        try:
+            efetch_data = await efetch_handle.text()
+            data = xmltodict.parse(efetch_data, xml_attribs=True)
+        except:
+            print(efetch_handle)
+            data = {}
+
+        return data
 
 
 async def get_icite(session, pmids):
     async with session.get('https://icite.od.nih.gov/api/pubs',
-                params={"pmids": ','.join(pmids)}) as icite_handle:
+                params={'pmids': ','.join(pmids)}) as icite_handle:
         assert icite_handle.status == 200
-        icite_resp = await icite_handle.json()
-        return icite_resp.get("data")
 
+        try:
+            icite_resp = await icite_handle.json()
+        except:
+            print(icite_resp)
+            icite_resp = {'data': {}}
+        return icite_resp.get('data')
+
+
+def reg_get_icite(pmids):
+    icite_handle = req.get('https://icite.od.nih.gov/api/pubs', params={'pmids': ','.join(pmids)})
+    assert icite_handle.status == 200
+
+    try:
+        icite_resp = icite_handle.json()
+    except:
+        print(icite_resp)
+        icite_resp = {'data': {}}
+
+    return icite_resp.get('data')
 
 async def main(loop):
-    async with aiohttp.ClientSession(loop=loop) as session:
-        async for pmid_block, percent_done in get_pmid_block(session):
-            print(percent_done)
-            icite_recs = await get_icite(session, pmid_block)
-            pm_block = await get_author_count(session, pmid_block)
+    async with aiohttp.ClientSession(loop=loop, cookie_jar=aiohttp.DummyCookieJar()) as session:
 
-            for article in pm_block['PubmedArticleSet']['PubmedArticle']:
-                pmid = article['MedlineCitation']['PMID']['#text']
-                with open('data/pubmed_esearch/{}.pickle'.format(pmid), 'wb') as out_conn:
-                    pickle.dump(article, out_conn)
+        pmid_count, webenv, query_key = await get_pmid_count(session)
+        print(pmid_count)
+
+        for pmid_block, percent_done, block_num in reg_get_pmid_block(session, pmid_count, webenv, query_key):
+            print(percent_done)
+            icite_recs = reg_get_icite(pmid_block)
+            efetch_recs = reg_get_author_count(pmid_block)
+
+            with open('data/pubmed_esearch/block_{}.pickle'.format(block_num), 'wb') as out_conn:
+                pickle.dump(efetch_recs, out_conn)
             
-            for rec in icite_recs:
-                with open('data/icite/{}.pickle'.format(pmid), 'wb') as out_conn:
-                    pickle.dump(rec, out_conn)
+            with open('data/icite/block_{}.pickle'.format(block_num), 'wb') as out_conn:
+                pickle.dump(icite_recs, out_conn)
 
 
 def __main__():
